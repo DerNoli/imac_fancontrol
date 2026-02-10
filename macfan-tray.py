@@ -7,6 +7,7 @@ import os
 import subprocess
 import configparser
 import xml.etree.ElementTree as ET
+import math
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 from PyQt6.QtGui import QIcon
 from PyQt6.QtCore import QTimer
@@ -24,7 +25,32 @@ def read_int(path):
         return 0
 
 # ---------------------------------------------------------
-# UNIVERSAL THEME DETECTION (CLI VERSION - PREVENTS BLOCKING)
+# LOGARITHMIC FAN CURVE
+# ---------------------------------------------------------
+
+def fan_curve(temp):
+    """
+    Logarithmische Lüfterkurve:
+    - temp: gewichtete Temperatur (°C)
+    - Rückgabe: Ziel-RPM
+    """
+
+    # Sicherheitskorridor
+    temp = max(30, min(temp, 95))
+
+    # Logarithmische Steigung
+    # 30°C → ~800 RPM
+    # 50°C → ~1500 RPM
+    # 70°C → ~2500 RPM
+    # 90°C → ~3500 RPM
+    rpm = 800 + 1200 * math.log1p((temp - 30) / 10)
+
+    # Begrenzen
+    return int(max(800, min(rpm, 4000)))
+
+
+# ---------------------------------------------------------
+# UNIVERSAL THEME DETECTION
 # ---------------------------------------------------------
 
 class ThemeDetector:
@@ -32,13 +58,11 @@ class ThemeDetector:
         self.cached_dark = False
         self.update_theme()
 
-        # Re-check theme every 60 seconds
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_theme)
         self.timer.start(60000)
 
     def _get_gsettings(self, schema, key):
-        """Helper to get gsettings without holding a Gio lock."""
         try:
             cmd = ["gsettings", "get", schema, key]
             return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip().strip("'")
@@ -124,7 +148,7 @@ class ThemeDetector:
             if result is not None:
                 self.cached_dark = result
                 return
-        self.cached_dark = False  # fallback
+        self.cached_dark = False
 
     def is_dark(self):
         return self.cached_dark
@@ -158,6 +182,8 @@ class MacFanTray:
         self.timer.timeout.connect(self.update)
         self.timer.start(2000)
 
+        self.last_mode = None
+
         self.update()
 
     def themed_icon(self, cold, normal, hot, weighted):
@@ -177,7 +203,8 @@ class MacFanTray:
         fan = read_int(FAN_SENSOR)
         weighted = int(cpu * 0.4 + gpu * 0.6)
 
-        # Breeze icon paths
+        target_rpm = fan_curve(weighted)
+
         cold_icons = {
             "light": "/usr/share/icons/breeze/status/22/temperature-cold.svg",
             "dark": "/usr/share/icons/breeze-dark/status/22/temperature-cold.svg"
@@ -195,9 +222,24 @@ class MacFanTray:
         self.tray.setIcon(icon)
 
         mode = "COOL" if weighted < 45 else "NORMAL" if weighted < 70 else "HOT"
+
         self.info_action.setText(
-            f"CPU: {cpu}°C | GPU: {gpu}°C | Fan: {fan} RPM | Mode: {mode}"
+            f"CPU: {cpu}°C | GPU: {gpu}°C | Fan: {fan} RPM | Target: {target_rpm} RPM | Mode: {mode}"
         )
+
+        self.tray.setToolTip(
+            f"CPU: {cpu}°C\nGPU: {gpu}°C\nFan: {fan} RPM\nTarget: {target_rpm} RPM\nMode: {mode}"
+        )
+
+        if mode != self.last_mode:
+            if self.last_mode is not None:
+                self.tray.showMessage(
+                    "MacFanTray",
+                    f"Profil gewechselt: {mode}\nCPU {cpu}°C | GPU {gpu}°C | Fan {fan} RPM | Ziel {target_rpm} RPM",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    4000
+                )
+            self.last_mode = mode
 
     def run(self):
         sys.exit(self.app.exec())
