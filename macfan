@@ -1,27 +1,27 @@
 #!/bin/bash
 export LC_ALL=C
 
-echo 1 > /sys/devices/LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:5e/APP0001:00/fan1_manual
+echo 1 > /sys/devices/platform/applesmc.768/fan1_manual
 
 # Temp-Detection files - set according to your system
 
-CPU_TEMP="/sys/devices/LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:5e/APP0001:00/temp10_input"
-GPU_TEMP="/sys/devices/LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:5e/APP0001:00/temp23_input"
+CPU_TEMP="/sys/devices/platform/applesmc.768/temp17_input"
+GPU_TEMP="/sys/devices/platform/applesmc.768/temp25_input"
 
 # File to set the rpm
 
-FAN_OUTPUT="/sys/devices/LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:5e/APP0001:00/fan1_output"
+FAN_OUTPUT="/sys/devices/platform/applesmc.768/fan1_output"
 
 # Fan curve parameters
-MIN_FAN=1200
-MAX_FAN=2700
+MIN_FAN=1500
+MAX_FAN=4000
 
 # Temperature range for smooth ramp
 MIN_TEMP=40
-MAX_TEMP=76
+MAX_TEMP=65
 
 # GPU weighting (0.0–1.0)
-GPU_WEIGHT=0.6
+GPU_WEIGHT=0.7
 CPU_WEIGHT=0.4
 
 # Logarithmic curve aggressiveness
