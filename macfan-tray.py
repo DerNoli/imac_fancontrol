@@ -10,8 +10,8 @@ import configparser
 import xml.etree.ElementTree as ET
 import math
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
-from PyQt6.QtGui import QIcon
-from PyQt6.QtCore import QTimer
+from PyQt6.QtGui import QIcon, QPixmap, QPainter, QPainterPath, QColor, QPen
+from PyQt6.QtCore import QTimer, Qt, QRectF
 
 # ---------------------------------------------------------
 # CONFIG (muss zu macfan.sh passen)
@@ -29,6 +29,9 @@ MAX_TEMP = 65
 CPU_WEIGHT = 0.4
 GPU_WEIGHT = 0.7
 K = 0.12
+
+# Icon: wie fein der Füllstand abgestuft wird (Anzahl Schritte)
+ICON_STEPS = 24
 
 # ---------------------------------------------------------
 # HWMON HANDLING
@@ -79,6 +82,77 @@ def fan_curve(temp, min_fan, max_fan):
     rng = MAX_TEMP - MIN_TEMP
     scale = (max_fan - min_fan) / math.log(1 + K * rng)
     return int(round(min_fan + math.log(1 + K * x) * scale))
+
+
+# ---------------------------------------------------------
+# DYNAMIC THERMOMETER ICON
+# ---------------------------------------------------------
+
+def temp_fraction(weighted):
+    """Gewichtete Temperatur auf 0.0 .. 1.0 abbilden (MIN_TEMP .. MAX_TEMP)."""
+    frac = (weighted - MIN_TEMP) / (MAX_TEMP - MIN_TEMP)
+    return max(0.0, min(1.0, frac))
+
+
+def fill_color(frac):
+    """Grün (kalt) -> Gelb -> Rot (heiß)."""
+    hue = int(round(120 * (1.0 - frac)))
+    return QColor.fromHsv(hue, 220, 235)
+
+
+def build_icon(frac, dark):
+    """Thermometer zeichnen; die Füllung steigt mit der Temperatur."""
+    size = 64
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+    outline = QColor(235, 235, 235) if dark else QColor(55, 55, 55)
+
+    # Außenform: Röhre + Kugel
+    outer = QPainterPath()
+    outer.addRoundedRect(QRectF(23, 3, 18, 44), 9, 9)
+    outer.addEllipse(QRectF(19, 37, 26, 26))
+    outer = outer.simplified()
+
+    # Innenform (Füllbereich): Röhre + Kugel
+    inner = QPainterPath()
+    inner.addRoundedRect(QRectF(28, 8, 8, 42), 4, 4)
+    inner.addEllipse(QRectF(24, 42, 16, 16))
+    inner = inner.simplified()
+
+    # Füllung: Kugel immer gefüllt, Röhre steigt mit frac
+    level_empty = 46.0   # Oberkante der Kugel
+    level_full = 8.0     # Oberkante der Röhre
+    level_y = level_empty - frac * (level_empty - level_full)
+
+    p.save()
+    p.setClipPath(inner)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(fill_color(frac))
+    p.drawRect(QRectF(0, level_y, size, size - level_y))
+    p.restore()
+
+    # Umriss
+    pen = QPen(outline)
+    pen.setWidthF(4.0)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawPath(outer)
+
+    # Skalenstriche rechts der Röhre
+    tick_pen = QPen(outline)
+    tick_pen.setWidthF(3.0)
+    tick_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    p.setPen(tick_pen)
+    for y in (12, 22, 32):
+        p.drawLine(46, y, 54, y)
+
+    p.end()
+    return QIcon(pm)
 
 
 # ---------------------------------------------------------
@@ -211,11 +285,13 @@ class MacFanTray:
         self.tray.setContextMenu(self.menu)
         self.tray.setVisible(True)
 
+        self.icon_cache = {}
+        self.last_icon_key = None
+        self.last_mode = None
+
         self.timer = QTimer()
         self.timer.timeout.connect(self.update)
         self.timer.start(2000)
-
-        self.last_mode = None
 
         self.update()
 
@@ -225,15 +301,20 @@ class MacFanTray:
             self.cpu_path = find_temp(self.hw, CPU_LABEL, CPU_FALLBACK)
             self.gpu_path = find_temp(self.hw, GPU_LABEL, GPU_FALLBACK)
 
-    def themed_icon(self, cold, normal, hot, weighted):
-        mode_key = "dark" if self.theme.is_dark() else "light"
+    def set_fill_icon(self, weighted):
+        """Icon setzen; neu zeichnen nur, wenn sich Stufe oder Theme ändern."""
+        dark = self.theme.is_dark()
+        step = int(round(temp_fraction(weighted) * ICON_STEPS))
+        key = (step, dark)
 
-        if weighted < 45:
-            return QIcon(cold[mode_key])
-        elif weighted < 70:
-            return QIcon(normal[mode_key])
-        else:
-            return QIcon(hot[mode_key])
+        if key == self.last_icon_key:
+            return
+
+        if key not in self.icon_cache:
+            self.icon_cache[key] = build_icon(step / ICON_STEPS, dark)
+
+        self.tray.setIcon(self.icon_cache[key])
+        self.last_icon_key = key
 
     def update(self):
         # Pfad neu bestimmen, falls hwmon fehlt (z. B. Modul neu geladen)
@@ -258,20 +339,7 @@ class MacFanTray:
         pwm = read_str(os.path.join(self.hw, "pwm1_enable"))
         ctrl = "manuell" if pwm == "1" else "Automatik" if pwm in ("0", "2") else "?"
 
-        cold_icons = {
-            "light": "/usr/share/icons/breeze/status/22/temperature-cold.svg",
-            "dark": "/usr/share/icons/breeze-dark/status/22/temperature-cold.svg"
-        }
-        normal_icons = {
-            "light": "/usr/share/icons/breeze/status/22/temperature-normal.svg",
-            "dark": "/usr/share/icons/breeze-dark/status/22/temperature-normal.svg"
-        }
-        hot_icons = {
-            "light": "/usr/share/icons/breeze/status/22/temperature-hot.svg",
-            "dark": "/usr/share/icons/breeze-dark/status/22/temperature-hot.svg"
-        }
-
-        self.tray.setIcon(self.themed_icon(cold_icons, normal_icons, hot_icons, weighted))
+        self.set_fill_icon(weighted)
 
         mode = "COOL" if weighted < 45 else "NORMAL" if weighted < 70 else "HOT"
 
