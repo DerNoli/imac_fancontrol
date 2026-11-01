@@ -1,26 +1,59 @@
 #!/bin/bash
 export LC_ALL=C
 
-echo 1 > /sys/devices/platform/applesmc.768/fan1_manual
+# hwmon-Verzeichnis des applesmc anhand des Namens finden (Nummer ändert sich pro Boot)
+HW=""
+for d in /sys/class/hwmon/hwmon*; do
+    if [ "$(cat "$d/name" 2>/dev/null)" = "applesmc" ]; then
+        HW="$d"
+        break
+    fi
+done
+if [ -z "$HW" ]; then
+    logger -t macfan "applesmc hwmon nicht gefunden, Abbruch."
+    exit 1
+fi
 
-# Temp-Detection files - set according to your system
+# Temperatursensoren per Label (SMC-Key), Fallback auf Nummer.
+# Label sind case-sensitiv: TG0d (temp25) != TG0D (temp19)
+CPU_LABEL="TCXc"
+GPU_LABEL="TG0d"
+CPU_FALLBACK="$HW/temp17_input"
+GPU_FALLBACK="$HW/temp25_input"
 
-CPU_TEMP="/sys/devices/platform/applesmc.768/temp17_input"
-GPU_TEMP="/sys/devices/platform/applesmc.768/temp25_input"
+find_temp() {
+    local label="$1" fallback="$2" f
+    for f in "$HW"/temp*_label; do
+        if [ "$(cat "$f" 2>/dev/null)" = "$label" ]; then
+            echo "${f%_label}_input"
+            return
+        fi
+    done
+    echo "$fallback"
+}
 
-# File to set the rpm
+CPU_TEMP=$(find_temp "$CPU_LABEL" "$CPU_FALLBACK")
+GPU_TEMP=$(find_temp "$GPU_LABEL" "$GPU_FALLBACK")
 
-FAN_OUTPUT="/sys/devices/platform/applesmc.768/fan1_output"
+# Lüfter-Dateien
+FAN_TARGET="$HW/fan1_target"
+FAN_ENABLE="$HW/pwm1_enable"
 
 # Fan curve parameters
 MIN_FAN=1500
 MAX_FAN=4000
 
+# Hardware-Grenzen einlesen und Kurve darauf begrenzen
+HW_MIN=$(cat "$HW/fan1_min")
+HW_MAX=$(cat "$HW/fan1_max")
+[ "$MIN_FAN" -lt "$HW_MIN" ] && MIN_FAN=$HW_MIN
+[ "$MAX_FAN" -gt "$HW_MAX" ] && MAX_FAN=$HW_MAX
+
 # Temperature range for smooth ramp
 MIN_TEMP=40
 MAX_TEMP=65
 
-# GPU weighting (0.0–1.0)
+# Weighting
 GPU_WEIGHT=0.7
 CPU_WEIGHT=0.4
 
@@ -30,7 +63,18 @@ K=0.12
 HYSTERESIS=10
 LAST_FAN=0
 
-logger -t macfan "$(date '+%d.%m.%Y %H:%M:%S') MacFan started with GPU‑weighted logarithmic fan curve."
+# Beim Beenden zurück auf SMC-Automatik (2)
+cleanup() {
+    echo 2 > "$FAN_ENABLE"
+    logger -t macfan "MacFan beendet, Lüfter wieder auf Automatik."
+}
+trap cleanup EXIT
+trap 'exit 0' INT TERM
+
+# Manuellen Modus aktivieren
+echo 1 > "$FAN_ENABLE" || { logger -t macfan "pwm1_enable nicht schreibbar"; exit 1; }
+
+logger -t macfan "$(date '+%d.%m.%Y %H:%M:%S') MacFan started (CPU=$CPU_TEMP GPU=$GPU_TEMP) with GPU-weighted logarithmic fan curve."
 
 while true; do
     RAW_CPU=$(cat "$CPU_TEMP")
@@ -53,13 +97,9 @@ while true; do
 
     else
         MODE="LOG"
-        # x = normalized temperature above MIN_TEMP
         X=$(echo "$TEMP - $MIN_TEMP" | bc -l)
-
-        # scale factor so log curve reaches MAX_FAN at MAX_TEMP
         RANGE=$(echo "$MAX_TEMP - $MIN_TEMP" | bc -l)
         SCALE=$(echo "($MAX_FAN - $MIN_FAN) / l(1 + $K * $RANGE)" | bc -l)
-
         FAN_FLOAT=$(echo "$MIN_FAN + l(1 + $K * $X) * $SCALE" | bc -l)
         FAN=$(printf "%.0f" "$FAN_FLOAT")
     fi
@@ -69,8 +109,8 @@ while true; do
 
     # Hysteresis
     DIFF=$(( FAN - LAST_FAN ))
-    if [ ${DIFF#-} -gt $HYSTERESIS ]; then
-        echo "$FAN" > "$FAN_OUTPUT"
+    if [ "${DIFF#-}" -gt "$HYSTERESIS" ]; then
+        echo "$FAN" > "$FAN_TARGET"
         LAST_FAN=$FAN
         logger -t macfan "$(date '+%d.%m.%Y %H:%M:%S') Fan set to ${FAN} RPM (MODE=${MODE})"
     fi
