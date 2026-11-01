@@ -4,6 +4,7 @@
 
 import sys
 import os
+import glob
 import subprocess
 import configparser
 import xml.etree.ElementTree as ET
@@ -12,41 +13,72 @@ from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 from PyQt6.QtGui import QIcon
 from PyQt6.QtCore import QTimer
 
-# Sensor Paths
-CPU_SENSOR = "/sys/devices/LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:5e/APP0001:00/temp10_input"
-GPU_SENSOR = "/sys/devices/LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:5e/APP0001:00/temp23_input"
-FAN_SENSOR = "/sys/devices/LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:5e/APP0001:00/fan1_input"
+# ---------------------------------------------------------
+# CONFIG (muss zu macfan.sh passen)
+# ---------------------------------------------------------
 
-def read_int(path):
+CPU_LABEL = "TCXc"
+GPU_LABEL = "TG0d"
+CPU_FALLBACK = "temp17_input"
+GPU_FALLBACK = "temp25_input"
+
+MIN_FAN = 1500
+MAX_FAN = 4000
+MIN_TEMP = 40
+MAX_TEMP = 65
+CPU_WEIGHT = 0.4
+GPU_WEIGHT = 0.7
+K = 0.12
+
+# ---------------------------------------------------------
+# HWMON HANDLING
+# ---------------------------------------------------------
+
+def read_str(path):
     try:
         with open(path, 'r') as f:
-            return int(f.read().strip())
-    except:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def read_int(path):
+    val = read_str(path)
+    try:
+        return int(val)
+    except (TypeError, ValueError):
         return 0
 
+
+def find_hwmon():
+    """hwmon-Verzeichnis des applesmc anhand des Namens finden."""
+    for d in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        if read_str(os.path.join(d, "name")) == "applesmc":
+            return d
+    return None
+
+
+def find_temp(hw, label, fallback):
+    """temp*_input-Datei zu einem SMC-Key-Label finden (case-sensitiv)."""
+    for f in glob.glob(os.path.join(hw, "temp*_label")):
+        if read_str(f) == label:
+            return f[:-len("_label")] + "_input"
+    return os.path.join(hw, fallback)
+
+
 # ---------------------------------------------------------
-# LOGARITHMIC FAN CURVE
+# LOGARITHMIC FAN CURVE (identisch zu macfan.sh)
 # ---------------------------------------------------------
 
-def fan_curve(temp):
-    """
-    Logarithmische Lüfterkurve:
-    - temp: gewichtete Temperatur (°C)
-    - Rückgabe: Ziel-RPM
-    """
-
-    # Sicherheitskorridor
-    temp = max(30, min(temp, 95))
-
-    # Logarithmische Steigung
-    # 30°C → ~800 RPM
-    # 50°C → ~1500 RPM
-    # 70°C → ~2500 RPM
-    # 90°C → ~3500 RPM
-    rpm = 800 + 1200 * math.log1p((temp - 30) / 10)
-
-    # Begrenzen
-    return int(max(800, min(rpm, 4000)))
+def fan_curve(temp, min_fan, max_fan):
+    if temp <= MIN_TEMP:
+        return min_fan
+    if temp >= MAX_TEMP:
+        return max_fan
+    x = temp - MIN_TEMP
+    rng = MAX_TEMP - MIN_TEMP
+    scale = (max_fan - min_fan) / math.log(1 + K * rng)
+    return int(round(min_fan + math.log(1 + K * x) * scale))
 
 
 # ---------------------------------------------------------
@@ -66,7 +98,7 @@ class ThemeDetector:
         try:
             cmd = ["gsettings", "get", schema, key]
             return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip().strip("'")
-        except:
+        except Exception:
             return None
 
     def detect_gnome_dark(self):
@@ -96,7 +128,7 @@ class ThemeDetector:
             cfg.read(path)
             scheme = cfg["General"]["ColorScheme"].lower()
             return "dark" in scheme
-        except:
+        except Exception:
             return None
 
     def detect_xfce_dark(self):
@@ -104,13 +136,11 @@ class ThemeDetector:
         if not os.path.exists(path):
             return None
         try:
-            tree = ET.parse(path)
-            root = tree.getroot()
-            for prop in root.findall("property"):
+            root = ET.parse(path).getroot()
+            for prop in root.iter("property"):
                 if prop.get("name") == "ThemeName":
-                    theme = prop.get("value", "").lower()
-                    return "dark" in theme
-        except:
+                    return "dark" in prop.get("value", "").lower()
+        except Exception:
             pass
         return None
 
@@ -121,16 +151,14 @@ class ThemeDetector:
         cfg = configparser.ConfigParser()
         try:
             cfg.read(path)
-            theme = cfg["General"]["theme"].lower()
-            return "dark" in theme
-        except:
+            return "dark" in cfg["General"]["theme"].lower()
+        except Exception:
             return None
 
     def detect_env_dark(self):
         for var in ["GTK_THEME", "QT_QPA_PLATFORMTHEME"]:
-            if var in os.environ:
-                if "dark" in os.environ[var].lower():
-                    return True
+            if var in os.environ and "dark" in os.environ[var].lower():
+                return True
         return None
 
     def update_theme(self):
@@ -163,6 +191,11 @@ class MacFanTray:
         self.app = QApplication(sys.argv)
         self.theme = ThemeDetector()
 
+        self.hw = None
+        self.cpu_path = None
+        self.gpu_path = None
+        self.resolve_paths()
+
         self.menu = QMenu()
         self.info_action = self.menu.addAction("Loading…")
         self.info_action.setDisabled(True)
@@ -186,10 +219,15 @@ class MacFanTray:
 
         self.update()
 
+    def resolve_paths(self):
+        self.hw = find_hwmon()
+        if self.hw:
+            self.cpu_path = find_temp(self.hw, CPU_LABEL, CPU_FALLBACK)
+            self.gpu_path = find_temp(self.hw, GPU_LABEL, GPU_FALLBACK)
+
     def themed_icon(self, cold, normal, hot, weighted):
-        dark = self.theme.is_dark()
-        mode_key = "dark" if dark else "light"
-        
+        mode_key = "dark" if self.theme.is_dark() else "light"
+
         if weighted < 45:
             return QIcon(cold[mode_key])
         elif weighted < 70:
@@ -198,12 +236,27 @@ class MacFanTray:
             return QIcon(hot[mode_key])
 
     def update(self):
-        cpu = read_int(CPU_SENSOR) // 1000
-        gpu = read_int(GPU_SENSOR) // 1000
-        fan = read_int(FAN_SENSOR)
-        weighted = int(cpu * 0.4 + gpu * 0.6)
+        # Pfad neu bestimmen, falls hwmon fehlt (z. B. Modul neu geladen)
+        if not self.hw or not os.path.isdir(self.hw):
+            self.resolve_paths()
+        if not self.hw:
+            self.info_action.setText("applesmc hwmon nicht gefunden")
+            self.tray.setToolTip("applesmc hwmon nicht gefunden")
+            return
 
-        target_rpm = fan_curve(weighted)
+        cpu = read_int(self.cpu_path) // 1000
+        gpu = read_int(self.gpu_path) // 1000
+        fan = read_int(os.path.join(self.hw, "fan1_input"))
+        hw_min = read_int(os.path.join(self.hw, "fan1_min")) or MIN_FAN
+        hw_max = read_int(os.path.join(self.hw, "fan1_max")) or MAX_FAN
+        min_fan = max(MIN_FAN, hw_min)
+        max_fan = min(MAX_FAN, hw_max)
+
+        weighted = int(round(cpu * CPU_WEIGHT + gpu * GPU_WEIGHT))
+        target_rpm = fan_curve(weighted, min_fan, max_fan)
+
+        pwm = read_str(os.path.join(self.hw, "pwm1_enable"))
+        ctrl = "manuell" if pwm == "1" else "Automatik" if pwm in ("0", "2") else "?"
 
         cold_icons = {
             "light": "/usr/share/icons/breeze/status/22/temperature-cold.svg",
@@ -218,17 +271,17 @@ class MacFanTray:
             "dark": "/usr/share/icons/breeze-dark/status/22/temperature-hot.svg"
         }
 
-        icon = self.themed_icon(cold_icons, normal_icons, hot_icons, weighted)
-        self.tray.setIcon(icon)
+        self.tray.setIcon(self.themed_icon(cold_icons, normal_icons, hot_icons, weighted))
 
         mode = "COOL" if weighted < 45 else "NORMAL" if weighted < 70 else "HOT"
 
         self.info_action.setText(
-            f"CPU: {cpu}°C | GPU: {gpu}°C | Fan: {fan} RPM | Target: {target_rpm} RPM | Mode: {mode}"
+            f"CPU: {cpu}°C | GPU: {gpu}°C | Fan: {fan} RPM | Target: {target_rpm} RPM | {mode} | {ctrl}"
         )
 
         self.tray.setToolTip(
-            f"CPU: {cpu}°C\nGPU: {gpu}°C\nFan: {fan} RPM\nTarget: {target_rpm} RPM\nMode: {mode}"
+            f"CPU: {cpu}°C\nGPU: {gpu}°C\nFan: {fan} RPM\nTarget: {target_rpm} RPM\n"
+            f"Mode: {mode}\nSteuerung: {ctrl}"
         )
 
         if mode != self.last_mode:
@@ -243,6 +296,7 @@ class MacFanTray:
 
     def run(self):
         sys.exit(self.app.exec())
+
 
 if __name__ == "__main__":
     MacFanTray().run()
