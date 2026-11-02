@@ -38,16 +38,43 @@ GPU_TEMP=$(find_temp "$GPU_LABEL" "$GPU_FALLBACK")
 # Lüfter-Dateien
 FAN_TARGET="$HW/fan1_target"
 FAN_ENABLE="$HW/pwm1_enable"
+FAN_MIN_FILE="$HW/fan1_min"
 
 # Fan curve parameters
-MIN_FAN=1500
+MIN_FAN=1200
 MAX_FAN=4000
 
-# Hardware-Grenzen einlesen und Kurve darauf begrenzen
-HW_MIN=$(cat "$HW/fan1_min")
+# Ab Linux 7.3 ist fan1_max read-only.
+# 1 = MAX_FAN auch dann verwenden, wenn es über fan1_max liegt
+# 0 = MAX_FAN auf fan1_max begrenzen
+FORCE_MAX=1
+
+# Hardware-Grenzen einlesen
+HW_MIN=$(cat "$FAN_MIN_FILE")
 HW_MAX=$(cat "$HW/fan1_max")
-[ "$MIN_FAN" -lt "$HW_MIN" ] && MIN_FAN=$HW_MIN
-[ "$MAX_FAN" -gt "$HW_MAX" ] && MAX_FAN=$HW_MAX
+ORIG_MIN=$HW_MIN
+MIN_CHANGED=0
+
+# Max
+if [ "$MAX_FAN" -gt "$HW_MAX" ]; then
+    if [ "$FORCE_MAX" -eq 1 ]; then
+        logger -t macfan "MAX_FAN $MAX_FAN liegt über fan1_max $HW_MAX, schreibe trotzdem."
+    else
+        logger -t macfan "MAX_FAN $MAX_FAN liegt über fan1_max $HW_MAX, begrenze auf $HW_MAX."
+        MAX_FAN=$HW_MAX
+    fi
+fi
+
+# Min: fan1_min ist schreibbar -> nur absenken, wenn Hardware-Minimum höher liegt
+if [ "$MIN_FAN" -lt "$HW_MIN" ]; then
+    if echo "$MIN_FAN" > "$FAN_MIN_FILE" 2>/dev/null; then
+        MIN_CHANGED=1
+        logger -t macfan "fan1_min von $HW_MIN auf $MIN_FAN gesetzt."
+    else
+        logger -t macfan "fan1_min nicht schreibbar, nutze Hardware-Minimum $HW_MIN."
+        MIN_FAN=$HW_MIN
+    fi
+fi
 
 # Temperature range for smooth ramp
 MIN_TEMP=40
@@ -63,10 +90,11 @@ K=0.12
 HYSTERESIS=10
 LAST_FAN=0
 
-# Beim Beenden zurück auf SMC-Automatik (2)
+# Beim Beenden zurück auf SMC-Automatik (2) und ursprüngliches Minimum
 cleanup() {
     echo 2 > "$FAN_ENABLE"
-    logger -t macfan "MacFan beendet, Lüfter wieder auf Automatik."
+    [ "$MIN_CHANGED" -eq 1 ] && echo "$ORIG_MIN" > "$FAN_MIN_FILE" 2>/dev/null
+    logger -t macfan "MacFan beendet, Lüfter wieder auf Automatik (fan1_min=$ORIG_MIN)."
 }
 trap cleanup EXIT
 trap 'exit 0' INT TERM
@@ -74,7 +102,7 @@ trap 'exit 0' INT TERM
 # Manuellen Modus aktivieren
 echo 1 > "$FAN_ENABLE" || { logger -t macfan "pwm1_enable nicht schreibbar"; exit 1; }
 
-logger -t macfan "$(date '+%d.%m.%Y %H:%M:%S') MacFan started (CPU=$CPU_TEMP GPU=$GPU_TEMP) with GPU-weighted logarithmic fan curve."
+logger -t macfan "$(date '+%d.%m.%Y %H:%M:%S') MacFan started (CPU=$CPU_TEMP GPU=$GPU_TEMP, MIN=$MIN_FAN MAX=$MAX_FAN, HW_MIN=$HW_MIN HW_MAX=$HW_MAX) with GPU-weighted logarithmic fan curve."
 
 while true; do
     RAW_CPU=$(cat "$CPU_TEMP")
@@ -110,9 +138,12 @@ while true; do
     # Hysteresis
     DIFF=$(( FAN - LAST_FAN ))
     if [ "${DIFF#-}" -gt "$HYSTERESIS" ]; then
-        echo "$FAN" > "$FAN_TARGET"
-        LAST_FAN=$FAN
-        logger -t macfan "$(date '+%d.%m.%Y %H:%M:%S') Fan set to ${FAN} RPM (MODE=${MODE})"
+        if echo "$FAN" > "$FAN_TARGET" 2>/dev/null; then
+            LAST_FAN=$FAN
+            logger -t macfan "$(date '+%d.%m.%Y %H:%M:%S') Fan set to ${FAN} RPM (MODE=${MODE})"
+        else
+            logger -t macfan "Schreiben von ${FAN} RPM nach fan1_target fehlgeschlagen."
+        fi
     fi
 
     sleep 2
