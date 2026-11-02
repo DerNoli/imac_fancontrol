@@ -2,7 +2,7 @@
 
 pkgname=imac_fancontrol
 pkgver=2.0
-pkgrel=2
+pkgrel=3
 pkgdesc="Mac Fan Tray + Fan Daemon for Linux for 7.3 kernel"
 arch=('any')
 url="https://example.com"
@@ -20,8 +20,13 @@ source=(
     'macfantray.service'
 )
 
-# Use 'updpkgsums' to generate these properly before uploading
-sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+# macfan und macfan-tray.py sind neu (Min 1200 / Max 4000, FORCE_MAX).
+# Für die übrigen Dateien: 'updpkgsums' ausführen.
+sha256sums=('7048c52b71a0662171a18ad02f663b7e2f33d42283c00e3506d042c347cebdae'
+            'SKIP'
+            '3e007601c592fd6c3d89b7af9fe3b41d119faf4e62bc272714274a5d85c0c4af'
+            'SKIP'
+            'SKIP')
 
 package() {
     # Install system-level fan script
