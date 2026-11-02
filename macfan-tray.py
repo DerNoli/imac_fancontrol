@@ -14,7 +14,7 @@ from PyQt6.QtGui import QIcon, QPixmap, QPainter, QPainterPath, QColor, QPen
 from PyQt6.QtCore import QTimer, Qt, QRectF
 
 # ---------------------------------------------------------
-# CONFIG (muss zu macfan.sh passen)
+# CONFIG (muss zu macfan passen)
 # ---------------------------------------------------------
 
 CPU_LABEL = "TCXc"
@@ -22,8 +22,12 @@ GPU_LABEL = "TG0d"
 CPU_FALLBACK = "temp17_input"
 GPU_FALLBACK = "temp25_input"
 
-MIN_FAN = 1500
+MIN_FAN = 1200
 MAX_FAN = 4000
+# Wie FORCE_MAX in macfan: True = MAX_FAN auch über fan1_max (read-only ab
+# Linux 7.3) hinaus verwenden, False = auf fan1_max begrenzen
+FORCE_MAX = True
+
 MIN_TEMP = 40
 MAX_TEMP = 65
 CPU_WEIGHT = 0.4
@@ -70,7 +74,7 @@ def find_temp(hw, label, fallback):
 
 
 # ---------------------------------------------------------
-# LOGARITHMIC FAN CURVE (identisch zu macfan.sh)
+# LOGARITHMIC FAN CURVE (identisch zu macfan)
 # ---------------------------------------------------------
 
 def fan_curve(temp, min_fan, max_fan):
@@ -330,8 +334,12 @@ class MacFanTray:
         fan = read_int(os.path.join(self.hw, "fan1_input"))
         hw_min = read_int(os.path.join(self.hw, "fan1_min")) or MIN_FAN
         hw_max = read_int(os.path.join(self.hw, "fan1_max")) or MAX_FAN
+
+        # Min: macfan senkt fan1_min auf MIN_FAN; ist das nicht möglich,
+        # gilt das Hardware-Minimum (identisch zu macfan)
         min_fan = max(MIN_FAN, hw_min)
-        max_fan = min(MAX_FAN, hw_max)
+        # Max: fan1_max ist ab Linux 7.3 read-only; mit FORCE_MAX gilt MAX_FAN
+        max_fan = MAX_FAN if FORCE_MAX else min(MAX_FAN, hw_max)
 
         weighted = int(round(cpu * CPU_WEIGHT + gpu * GPU_WEIGHT))
         target_rpm = fan_curve(weighted, min_fan, max_fan)
